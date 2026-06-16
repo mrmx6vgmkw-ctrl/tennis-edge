@@ -163,14 +163,14 @@ async function proxyFetch(url) {
 
 async function fetchTennis(apiKey) {
   // Step 1: get active sports via our /api/odds serverless proxy
-  const sRes = await proxyFetch(`${BASE}/sports/?apiKey=${apiKey}&all=false`);
+  const sRes = await proxyFetch(`${BASE}/sports/?apiKey=${apiKey}&all=true`);
   if (sRes.status === 401) throw new Error("INVALID_KEY");
   if (!sRes.ok) throw new Error(`Sports list failed: ${sRes.status}`);
   const allSports = await sRes.json();
   const remaining = sRes.headers.get("x-requests-remaining");
 
   const activeTennis = Array.isArray(allSports)
-    ? allSports.filter(s => s.key?.startsWith("tennis_"))
+    ? allSports.filter(s => s.key?.startsWith("tennis_") && s.active !== false)
     : [];
 
   if (!activeTennis.length) return { matches: [], quota: { remaining }, activeSports: [] };
