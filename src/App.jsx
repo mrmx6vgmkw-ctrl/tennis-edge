@@ -77,98 +77,46 @@ function bestOdds(bookmakers, home, away) {
 }
 
 async function proxyFetch(url) {
-  // Extract path and params from the Odds API URL, route through our server proxy
-  const u = new URL(url);
-  const path = u.pathname.replace("/v4/", "");
-  const params = new URLSearchParams(u.searchParams);
-  params.set("path", path);
-  const proxyUrl = `/api/odds?${params.toString()}`;
-  const r = await fetch(proxyUrl, { signal: AbortSignal.timeout(15000) });
+  // Route through /api/odds Vercel serverless function
+  // Pass the full Odds API URL as a query param so the server fetches it
+  const proxyUrl = `/api/odds?target=${encodeURIComponent(url)}`;
+  const r = await fetch(proxyUrl);
   if (!r.ok) throw new Error(`Proxy error: ${r.status}`);
   return r;
 }
 
 async function fetchTennis(apiKey) {
-  // Route through Claude API using web_search tool to bypass CORS
-  // Claude fetches the Odds API server-side where CORS doesn't apply
-  const prompt = `Fetch this URL and return ONLY the raw JSON response, nothing else, no markdown, no explanation:
-https://api.the-odds-api.com/v4/sports/?apiKey=${apiKey}&all=false`;
+  // Step 1: get active sports via our /api/odds serverless proxy
+  const sRes = await proxyFetch(`${BASE}/sports/?apiKey=${apiKey}&all=false`);
+  if (sRes.status === 401) throw new Error("INVALID_KEY");
+  if (!sRes.ok) throw new Error(`Sports list failed: ${sRes.status}`);
+  const allSports = await sRes.json();
+  const remaining = sRes.headers.get("x-requests-remaining");
 
-  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-
-  if (!claudeRes.ok) throw new Error("Claude API error");
-  const claudeData = await claudeRes.json();
-
-  // Extract JSON from Claude's response
-  const textBlock = claudeData.content?.find(b => b.type === "text");
-  if (!textBlock) throw new Error("No response from Claude");
-
-  let sportsJson;
-  try {
-    // Strip any markdown fences
-    const clean = textBlock.text.replace(/```json|```/g, "").trim();
-    sportsJson = JSON.parse(clean);
-  } catch {
-    // Try to extract JSON array from response
-    const match = textBlock.text.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("Could not parse sports list");
-    sportsJson = JSON.parse(match[0]);
-  }
-
-  if (sportsJson.error_code === "invalid-api-key") throw new Error("INVALID_KEY");
-
-  const activeTennis = Array.isArray(sportsJson)
-    ? sportsJson.filter(s => s.key?.startsWith("tennis_"))
+  const activeTennis = Array.isArray(allSports)
+    ? allSports.filter(s => s.key?.startsWith("tennis_"))
     : [];
 
-  if (!activeTennis.length) return { matches: [], quota: { remaining: "—" }, activeSports: [] };
+  if (!activeTennis.length) return { matches: [], quota: { remaining }, activeSports: [] };
 
-  // Fetch odds for each sport via Claude web_search
+  // Step 2: fetch odds for each active tennis sport
   const results = [];
-  for (const sport of activeTennis.slice(0, 5)) { // limit to 5 to save API quota
+  let lastRemaining = remaining;
+
+  for (const sport of activeTennis) {
     try {
-      const oddsPrompt = `Fetch this URL and return ONLY the raw JSON, no explanation, no markdown:
-https://api.the-odds-api.com/v4/sports/${sport.key}/odds/?apiKey=${apiKey}&regions=us,uk&markets=h2h&oddsFormat=american`;
+      const res = await proxyFetch(
+        `${BASE}/sports/${sport.key}/odds/?apiKey=${apiKey}&regions=us,uk&markets=h2h&oddsFormat=american`
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      lastRemaining = res.headers.get("x-requests-remaining") || lastRemaining;
+      if (!Array.isArray(data)) continue;
 
-      const oddsRes = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 8000,
-          tools: [{ type: "web_search_20250305", name: "web_search" }],
-          messages: [{ role: "user", content: oddsPrompt }],
-        }),
-      });
-
-      if (!oddsRes.ok) continue;
-      const oddsData = await oddsRes.json();
-      const oddsText = oddsData.content?.find(b => b.type === "text")?.text || "";
-      const clean = oddsText.replace(/```json|```/g, "").trim();
-
-      let events;
-      try {
-        events = JSON.parse(clean);
-      } catch {
-        const m = clean.match(/\[[\s\S]*\]/);
-        if (!m) continue;
-        events = JSON.parse(m[0]);
-      }
-
-      if (!Array.isArray(events)) continue;
       const surface = inferSurf(sport.key);
       const tournament = fmtTournament(sport.key);
 
-      for (const ev of events) {
+      for (const ev of data) {
         if (!ev.bookmakers?.length) continue;
         const {b1,b2,o1,o2} = bestOdds(ev.bookmakers, ev.home_team, ev.away_team);
         if (!b1||!b2) continue;
@@ -186,9 +134,8 @@ https://api.the-odds-api.com/v4/sports/${sport.key}/odds/?apiKey=${apiKey}&regio
     } catch { continue; }
   }
 
-  return { matches: results, quota: { remaining: "see the-odds-api.com" }, activeSports: activeTennis.map(s=>s.title||s.key) };
+  return { matches: results, quota: { remaining: lastRemaining }, activeSports: activeTennis.map(s=>s.title||s.key) };
 }
-
 // ── DEMO ──────────────────────────────────────────────────────────────────────
 const DEMO = [
   { id:"d1",tournament:"Wimbledon",surface:"Grass",time:"13:00 BST",_live:false,
@@ -265,7 +212,7 @@ function Setup({onSave,onDemo}) {
   );
 }
 
-function MLCard({match,onAI,busy}) {
+function MLCard({match,onAI,busy,rank}) {
   const {ml,p1,p2}=match;
   if(!ml.trueP1) return null;
   const e1=calcEdge(ml.trueP1,ml.p1Odds),e2=calcEdge(1-ml.trueP1,ml.p2Odds);
@@ -278,6 +225,7 @@ function MLCard({match,onAI,busy}) {
           <CourtSVG surface={match.surface}/>
           <div style={{flex:1}}>
             <div style={{display:"flex",gap:6,marginBottom:3,flexWrap:"wrap",alignItems:"center"}}>
+              {rank&&<span style={{color:"#000",background:C.ball,fontSize:9,fontWeight:900,padding:"1px 5px",borderRadius:2,fontFamily:"monospace"}}>#{rank}</span>}
               <span style={{color:C.chalkDim,fontSize:10,fontFamily:"monospace"}}>{match.tournament}</span>
               <Pill surface={match.surface}/>
               <span style={{color:C.textMuted,fontSize:10,fontFamily:"monospace"}}>{match.time}</span>
@@ -469,9 +417,15 @@ Context: ${prop.note}
 
   const mlE=matches.reduce((n,m)=>n+(m.ml.trueP1&&calcEdge(m.ml.trueP1,m.ml.p1Odds)>3?1:0)+(m.ml.trueP1&&calcEdge(1-m.ml.trueP1,m.ml.p2Odds)>3?1:0),0);
   const prE=matches.reduce((n,m)=>n+(m.props||[]).filter(p=>calcEdge(p.trueProb??0.5,p.bookOdds)>3).length,0);
+  // Sort all matches by best edge descending
+  const sorted=[...matches].sort((a,b)=>{
+    const ea=Math.max(calcEdge(a.ml.trueP1||0.5,a.ml.p1Odds),calcEdge(1-(a.ml.trueP1||0.5),a.ml.p2Odds));
+    const eb=Math.max(calcEdge(b.ml.trueP1||0.5,b.ml.p1Odds),calcEdge(1-(b.ml.trueP1||0.5),b.ml.p2Odds));
+    return eb-ea;
+  });
   const shown=filter==="value"
-    ?matches.filter(m=>tab==="ml"?m.ml.trueP1&&(calcEdge(m.ml.trueP1,m.ml.p1Odds)>3||calcEdge(1-m.ml.trueP1,m.ml.p2Odds)>3):(m.props||[]).some(p=>calcEdge(p.trueProb??0.5,p.bookOdds)>3))
-    :matches;
+    ?sorted.filter(m=>tab==="ml"?m.ml.trueP1&&(calcEdge(m.ml.trueP1,m.ml.p1Odds)>3||calcEdge(1-m.ml.trueP1,m.ml.p2Odds)>3):(m.props||[]).some(p=>calcEdge(p.trueProb??0.5,p.bookOdds)>3))
+    :sorted;
 
   return (
     <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Inter',system-ui,sans-serif"}}>
@@ -513,8 +467,10 @@ Context: ${prop.note}
           :shown.length===0
             ?<div style={{color:C.textDim,fontFamily:"monospace",fontSize:12,padding:"40px 0",textAlign:"center"}}>No matches. Try ALL filter or hit ↻ to refresh.</div>
             :tab==="ml"
-              ?shown.map((m,i)=><MLCard key={m.id||i} match={m} onAI={aiML} busy={busy}/>)
-              :shown.map((m,i)=><PropsCard key={m.id||i} match={m} onAI={aiProp} busy={busy}/>)
+              ?shown.map((m,i)=><MLCard key={m.id||i} match={m} rank={i+1} onAI={aiML} busy={busy}/>)
+              :shown.filter(m=>m.props?.length>0).length===0
+                ?<div style={{color:C.textDim,fontFamily:"monospace",fontSize:12,padding:"40px 16px",textAlign:"center",lineHeight:1.8}}>Props markets require a paid Odds API tier.<br/>Moneyline edge is available now — switch to MONEYLINE tab.</div>
+                :shown.map((m,i)=><PropsCard key={m.id||i} match={m} onAI={aiProp} busy={busy}/>)
         }
         <div style={{color:C.textMuted,fontSize:9,fontFamily:"monospace",textAlign:"center",lineHeight:1.8,marginTop:4}}>
           ELO MODEL ESTIMATES · NOT FINANCIAL ADVICE · BET RESPONSIBLY
