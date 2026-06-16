@@ -23,34 +23,44 @@ function eloExpected(e1, e2) { return 1/(1+Math.pow(10,(e2-e1)/400)); }
 // Find player in Elo ratings (handles "A. LastName" format from Odds API)
 function findElo(name, ratings, surface) {
   if (!name || !ratings) return null;
-  // Direct match
-  if (ratings[name]) {
-    const r = ratings[name];
-    return { overall: r.overall, surface: r[surface] || r.overall };
+
+  const clean = s => s.toLowerCase().replace(/[^a-z ]/g,"").trim();
+  const eloResult = (data) => ({ overall: data.overall, surface: data[surface] || data.overall });
+
+  // 1. Direct match
+  if (ratings[name]) return eloResult(ratings[name]);
+
+  // 2. Case-insensitive direct match
+  const nameLower = clean(name);
+  for (const [k,v] of Object.entries(ratings)) {
+    if (clean(k) === nameLower) return eloResult(v);
   }
-  // "A. LastName" → match by initial + last name
+
+  // 3. "A. De Minaur" → try matching first initial + last name
   const parts = name.trim().split(" ");
-  if (parts.length >= 2 && /^[A-Z]\.$/.test(parts[0])) {
+  if (parts.length >= 2) {
+    const isInitial = /^[A-Z]\.?$/.test(parts[0]);
+    const lastName = clean(parts.slice(1).join(" "));
     const initial = parts[0].replace(".","").toLowerCase();
-    const lastName = parts.slice(1).join(" ").toLowerCase();
+
     for (const [fullName, data] of Object.entries(ratings)) {
       const fp = fullName.trim().split(" ");
       if (fp.length < 2) continue;
       const fFirst = fp[0].toLowerCase();
-      const fLast = fp.slice(1).join(" ").toLowerCase();
-      if (fLast === lastName && fFirst.startsWith(initial)) {
-        return { overall: data.overall, surface: data[surface] || data.overall };
+      const fLast = clean(fp.slice(1).join(" "));
+      if (fLast === lastName && (isInitial ? fFirst.startsWith(initial) : fFirst === initial)) {
+        return eloResult(data);
       }
     }
-    // Fallback: last name only
-    for (const [fullName, data] of Object.entries(ratings)) {
-      const fp = fullName.trim().split(" ");
-      const fLast = fp.slice(1).join(" ").toLowerCase();
-      if (fLast === lastName) {
-        return { overall: data.overall, surface: data[surface] || data.overall };
-      }
-    }
+
+    // 4. Last name only fallback (risky but better than nothing)
+    const lastMatches = Object.entries(ratings).filter(([k]) => {
+      const fp = k.trim().split(" ");
+      return fp.length >= 2 && clean(fp.slice(1).join(" ")) === lastName;
+    });
+    if (lastMatches.length === 1) return eloResult(lastMatches[0][1]);
   }
+
   return null;
 }
 
@@ -192,13 +202,20 @@ async function fetchTennis(apiKey) {
           {name:p2name, odds:b2},
           surface, o1, o2, window._eloRatings||null
         );
+        // Skip matches where odds are extreme (>1500) — match already in progress and lopsided
+        const maxOdds = Math.max(Math.abs(b1), Math.abs(b2));
+        if (maxOdds > 1500) continue;
+
+        const commenceTime = new Date(ev.commence_time);
+        const isLive = commenceTime < new Date();
+
         results.push({
           id: ev.id, sport: sport.key, tournament, surface,
-          time: new Date(ev.commence_time).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",timeZoneName:"short"}),
+          time: commenceTime.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",timeZoneName:"short"}),
           p1: {name:p1name, seed:null, form:[]},
           p2: {name:p2name, seed:null, form:[]},
           ml: { p1Odds:b1, p2Odds:b2, trueP1, clv:{p1Open:o1,p2Open:o2}, keyFactor:`${tournament} · ${surface} · ${inferTier(sport.key)}` },
-          props: [], _live: true,
+          props: [], _live: isLive,
         });
       }
     } catch { continue; }
@@ -479,13 +496,24 @@ export default function App() {
     const title=`${p1.name} vs ${p2.name} — Moneyline`;
     const stats=[["EDGE",`${best>0?"+":""}${best.toFixed(1)}%`,best>0?C.ball:C.bad],["VERDICT",best>5?"STRONG BET":best>3?"BET":best>0?"LEAN":"PASS",best>3?C.ball:C.bad]];
     setAnalysis({title,loading:true,text:"",stats});
-    const text=await claude(`Sharp tennis moneyline analyst. Concise.
+    // Find Elo ratings for context
+    const elo1 = findElo(p1.name, window._eloRatings, match.surface);
+    const elo2 = findElo(p2.name, window._eloRatings, match.surface);
+    const eloCtx = elo1 && elo2
+      ? `Elo ratings: ${p1.name} overall=${elo1.overall} ${match.surface}=${elo1.surface} / ${p2.name} overall=${elo2.overall} ${match.surface}=${elo2.surface} (source: tennisabstract.com)`
+      : "Elo ratings: not available for these players";
+
+    const text=await claude(`You are a sharp tennis moneyline analyst. Be concise and specific.
 Match: ${p1.name} vs ${p2.name} — ${match.tournament} (${match.surface})
-Lines: ${p1.name} ${fmt(ml.p1Odds)} / ${p2.name} ${fmt(ml.p2Odds)}
-Elo prob: ${p1.name} ${(ml.trueP1*100).toFixed(0)}% / ${p2.name} ${((1-ml.trueP1)*100).toFixed(0)}%
-Edge: ${p1.name} ${e1.toFixed(1)}% / ${p2.name} ${e2.toFixed(1)}%
+Current lines: ${p1.name} ${fmt(ml.p1Odds)} / ${p2.name} ${fmt(ml.p2Odds)}
+Opening lines: ${p1.name} ${fmt(ml.clv.p1Open)} / ${p2.name} ${fmt(ml.clv.p2Open)}
+${eloCtx}
+True win probability (our model): ${p1.name} ${(ml.trueP1*100).toFixed(0)}% / ${p2.name} ${((1-ml.trueP1)*100).toFixed(0)}%
+Edge vs book: ${p1.name} ${e1.toFixed(1)}% / ${p2.name} ${e2.toFixed(1)}%
 Surface: ${match.surface}
-3–4 sentences. Where is the edge? Surface factors? Biggest risk? No preamble.`).catch(()=>"Error — try again.");
+Line movement: ${ml.p1Odds !== ml.clv.p1Open ? `${p1.name} moved from ${fmt(ml.clv.p1Open)} to ${fmt(ml.p1Odds)}` : "no significant movement"}
+
+3–4 sentences. Cover: where the real edge is, what the line movement signals, surface-specific factors, and the single biggest risk. Tennis terminology. No preamble.`).catch(()=>"Error — try again.");
     setAnalysis({title,loading:false,text,stats});setBusy(null);
   };
 
