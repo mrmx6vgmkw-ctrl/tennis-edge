@@ -8,60 +8,80 @@ const C = {
 };
 
 // ── PROBABILITY MODEL ────────────────────────────────────────────────────────
-// Instead of defaulting unknown players to 50/50 (which creates fake edges),
-// we use the book's own implied probability as the baseline, then apply
-// adjustments for: line movement, surface bias, and known player data.
 
 function impliedProb(odds) {
   const d = odds > 0 ? odds/100+1 : 100/Math.abs(odds)+1;
   return 1/d;
 }
-
-// Remove vig from a pair of odds to get true market probability
 function noVigProb(odds1, odds2) {
   const i1 = impliedProb(odds1), i2 = impliedProb(odds2);
   const total = i1 + i2;
-  return { p1: i1/total, p2: i2/total }; // normalized, vig removed
+  return { p1: i1/total, p2: i2/total };
+}
+function eloExpected(e1, e2) { return 1/(1+Math.pow(10,(e2-e1)/400)); }
+
+// Find player in Elo ratings (handles "A. LastName" format from Odds API)
+function findElo(name, ratings, surface) {
+  if (!name || !ratings) return null;
+  // Direct match
+  if (ratings[name]) {
+    const r = ratings[name];
+    return { overall: r.overall, surface: r[surface] || r.overall };
+  }
+  // "A. LastName" → match by initial + last name
+  const parts = name.trim().split(" ");
+  if (parts.length >= 2 && /^[A-Z]\.$/.test(parts[0])) {
+    const initial = parts[0].replace(".","").toLowerCase();
+    const lastName = parts.slice(1).join(" ").toLowerCase();
+    for (const [fullName, data] of Object.entries(ratings)) {
+      const fp = fullName.trim().split(" ");
+      if (fp.length < 2) continue;
+      const fFirst = fp[0].toLowerCase();
+      const fLast = fp.slice(1).join(" ").toLowerCase();
+      if (fLast === lastName && fFirst.startsWith(initial)) {
+        return { overall: data.overall, surface: data[surface] || data.overall };
+      }
+    }
+    // Fallback: last name only
+    for (const [fullName, data] of Object.entries(ratings)) {
+      const fp = fullName.trim().split(" ");
+      const fLast = fp.slice(1).join(" ").toLowerCase();
+      if (fLast === lastName) {
+        return { overall: data.overall, surface: data[surface] || data.overall };
+      }
+    }
+  }
+  return null;
 }
 
-// Known surface biases vs market (based on historical book mispricing)
-// Positive = player historically outperforms their price on this surface
-const SURFACE_BIAS = {
-  // Grass specialists undervalued on grass
-  "N. Djokovic": { Grass: +0.04 },
-  "E. Rybakina": { Grass: +0.05 },
-  "R. Nadal":    { Clay: +0.03 },
-  "I. Swiatek":  { Clay: +0.04, Grass: -0.06 },
-  "C. Alcaraz":  { Grass: +0.03 },
-  "J. Sinner":   { Hard: +0.03 },
-};
-
-// Line movement signal: if line moved significantly toward a player,
-// sharp money is on them — adjust true prob upward
 function lineMoveAdjust(currentOdds, openOdds) {
   if (!openOdds) return 0;
   const dec = o => o > 0 ? o/100+1 : 100/Math.abs(o)+1;
   const movePct = (dec(openOdds) - dec(currentOdds)) / dec(openOdds);
-  // Line moved toward this player (shorter price) = sharp signal
-  if (movePct > 0.05) return +0.02; // sharpened significantly
-  if (movePct < -0.05) return -0.02; // drifted, faded
+  if (movePct > 0.05) return +0.02;
+  if (movePct < -0.05) return -0.02;
   return 0;
 }
 
-function matchProb(p1, p2, surface, openOdds1, openOdds2) {
-  // Start from no-vig market probability
-  const { p1: base1 } = noVigProb(p1.odds, p2.odds);
-  let prob = base1;
+function matchProb(p1, p2, surface, openOdds1, openOdds2, eloRatings) {
+  const elo1 = findElo(p1.name, eloRatings, surface);
+  const elo2 = findElo(p2.name, eloRatings, surface);
 
-  // Apply surface bias for known players
-  const bias1 = SURFACE_BIAS[p1.name]?.[surface] || 0;
-  const bias2 = SURFACE_BIAS[p2.name]?.[surface] || 0;
-  prob = prob + bias1 - bias2;
+  let prob;
+  if (elo1 && elo2) {
+    // Both players found — use real Elo (blend overall + surface)
+    const sw = surface === "Grass" ? 0.65 : surface === "Clay" ? 0.6 : 0.5;
+    const e1 = elo1.overall * (1-sw) + elo1.surface * sw;
+    const e2 = elo2.overall * (1-sw) + elo2.surface * sw;
+    prob = eloExpected(e1, e2);
+  } else {
+    // Unknown players — fall back to no-vig market probability
+    const { p1: base1 } = noVigProb(p1.odds, p2.odds);
+    prob = base1;
+  }
 
-  // Apply line movement signal
-  const move1 = lineMoveAdjust(p1.odds, openOdds1);
-  const move2 = lineMoveAdjust(p2.odds, openOdds2);
-  prob = prob + move1 - move2;
+  // Line movement adjustment
+  prob += lineMoveAdjust(p1.odds, openOdds1) - lineMoveAdjust(p2.odds, openOdds2);
 
   return Math.max(0.05, Math.min(0.95, prob));
 }
@@ -163,7 +183,7 @@ async function fetchTennis(apiKey) {
         const trueP1 = matchProb(
           {name:p1name, odds:b1},
           {name:p2name, odds:b2},
-          surface, o1, o2
+          surface, o1, o2, window._eloRatings||null
         );
         results.push({
           id: ev.id, sport: sport.key, tournament, surface,
@@ -195,7 +215,11 @@ const DEMO = [
     props:[{market:"Total Games",dir:"Over",line:41.5,bookOdds:-118,trueProb:0.64,note:"Clay SF average 43.1 games"},{market:"Match Duration",dir:"Over",line:165.5,bookOdds:-105,trueProb:0.56,note:"Clay SF run 172 min average"}]},
 ];
 function withElo(ms) {
-  return ms.map(m=>({...m,ml:{...m.ml,trueP1:m.ml.trueP1??matchProb({name:m.p1.name,seed:m.p1.seed},{name:m.p2.name,seed:m.p2.seed},m.surface)}}));
+  return ms.map(m=>({...m,ml:{...m.ml,trueP1:m.ml.trueP1??matchProb(
+    {name:m.p1.name, odds:m.ml.p1Odds},
+    {name:m.p2.name, odds:m.ml.p2Odds},
+    m.surface, m.ml.clv?.p1Open, m.ml.clv?.p2Open, window._eloRatings||null
+  )}}));
 }
 
 // ── UI COMPONENTS ─────────────────────────────────────────────────────────────
@@ -393,6 +417,8 @@ export default function App() {
   const [busy,setBusy]=useState(null);
   const [quota,setQuota]=useState(null);
   const [activeSports,setActiveSports]=useState([]);
+  const [eloRatings,setEloRatings]=useState(null);
+  const [eloStatus,setEloStatus]=useState("loading");
 
   const load=useCallback(async(key)=>{
     setLoading(true);setError(null);
@@ -410,6 +436,20 @@ export default function App() {
       else setError(`Connection error: ${err.message}. Showing demo data.`);
       setMatches(withElo(DEMO));
     } finally { setLoading(false); }
+  },[]);
+
+  // Fetch real Elo ratings from Sackmann data on mount
+  useEffect(()=>{
+    fetch("/api/elo")
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.ratings){
+          setEloRatings(d.ratings);
+          window._eloRatings = d.ratings; // make available to fetchTennis
+          setEloStatus(`${d.players} players`);
+        } else setEloStatus("elo unavailable");
+      })
+      .catch(()=>setEloStatus("elo unavailable"));
   },[]);
 
   useEffect(()=>{
@@ -483,6 +523,7 @@ Context: ${prop.note}
               {mode==="demo"&&<span style={{color:C.textDim,fontSize:9,fontFamily:"monospace"}}>DEMO</span>}
             </div>
             {quota?.remaining&&<div style={{color:C.textMuted,fontSize:9,fontFamily:"monospace"}}>{quota.remaining} API req left</div>}
+            {eloStatus&&<div style={{color:eloStatus.includes("players")?C.ball:C.textMuted,fontSize:9,fontFamily:"monospace",marginTop:1}}>⚡ Elo: {eloStatus}</div>}
             {activeSports.length>0&&<div style={{color:C.textMuted,fontSize:9,fontFamily:"monospace",marginTop:1}}>↳ {activeSports.slice(0,3).join(" · ")}{activeSports.length>3?` +${activeSports.length-3} more`:""}</div>}
           </div>
           <div style={{display:"flex",gap:14,textAlign:"right"}}>
