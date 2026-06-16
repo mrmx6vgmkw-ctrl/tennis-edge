@@ -7,34 +7,73 @@ const C = {
   text: "#d4cfc8", textDim: "#55504a", textMuted: "#302c28",
 };
 
-// ── ELO ──────────────────────────────────────────────────────────────────────
-const SW = { Hard: 0.5, Clay: 0.6, Grass: 0.65 };
-const PE = {
-  "C. Alcaraz":  { o:2120, Clay:2090, Grass:2150, Hard:2100 },
-  "N. Djokovic": { o:2095, Clay:2080, Grass:2180, Hard:2090 },
-  "I. Swiatek":  { o:2110, Clay:2200, Grass:1920, Hard:2080 },
-  "E. Rybakina": { o:1980, Clay:1900, Grass:2060, Hard:1990 },
-  "J. Sinner":   { o:2130, Clay:2100, Grass:2050, Hard:2160 },
-  "H. Hurkacz":  { o:1920, Clay:1820, Grass:1980, Hard:1950 },
-  "B. Shelton":  { o:1850, Clay:1780, Grass:1820, Hard:1900 },
-  "A. Zverev":   { o:2010, Clay:2030, Grass:1940, Hard:2020 },
-  "D. Medvedev": { o:2050, Clay:1980, Grass:2010, Hard:2090 },
-  "A. Sabalenka":{ o:2080, Clay:2020, Grass:2000, Hard:2120 },
-  "C. Gauff":    { o:1960, Clay:1940, Grass:1930, Hard:1990 },
-};
-const SE = {1:2180,2:2100,3:2050,4:2010,5:1980,6:1960,7:1940,8:1920,9:1900,10:1885,12:1855,14:1825,16:1795};
+// ── PROBABILITY MODEL ────────────────────────────────────────────────────────
+// Instead of defaulting unknown players to 50/50 (which creates fake edges),
+// we use the book's own implied probability as the baseline, then apply
+// adjustments for: line movement, surface bias, and known player data.
 
-function getElo(name, surf, seed) {
-  const k = PE[name];
-  if (k) { const w = SW[surf]||0.5; return k.o*(1-w)+(k[surf]||k.o)*w; }
-  return (seed && SE[seed]) ? SE[seed] : 1500;
+function impliedProb(odds) {
+  const d = odds > 0 ? odds/100+1 : 100/Math.abs(odds)+1;
+  return 1/d;
 }
-function eloWin(e1,e2) { return 1/(1+Math.pow(10,(e2-e1)/400)); }
-function matchProb(p1,p2,surf) {
-  return Math.max(0.05,Math.min(0.95,eloWin(getElo(p1.name,surf,p1.seed),getElo(p2.name,surf,p2.seed))));
+
+// Remove vig from a pair of odds to get true market probability
+function noVigProb(odds1, odds2) {
+  const i1 = impliedProb(odds1), i2 = impliedProb(odds2);
+  const total = i1 + i2;
+  return { p1: i1/total, p2: i2/total }; // normalized, vig removed
 }
-function calcEdge(trueP,odds) { const d=odds>0?odds/100+1:100/Math.abs(odds)+1; return ((trueP-1/d)/(1/d))*100; }
-function calcKelly(trueP,odds) { const b=(odds>0?odds/100+1:100/Math.abs(odds)+1)-1; return Math.max(0,(trueP*b-(1-trueP))/b*0.5); }
+
+// Known surface biases vs market (based on historical book mispricing)
+// Positive = player historically outperforms their price on this surface
+const SURFACE_BIAS = {
+  // Grass specialists undervalued on grass
+  "N. Djokovic": { Grass: +0.04 },
+  "E. Rybakina": { Grass: +0.05 },
+  "R. Nadal":    { Clay: +0.03 },
+  "I. Swiatek":  { Clay: +0.04, Grass: -0.06 },
+  "C. Alcaraz":  { Grass: +0.03 },
+  "J. Sinner":   { Hard: +0.03 },
+};
+
+// Line movement signal: if line moved significantly toward a player,
+// sharp money is on them — adjust true prob upward
+function lineMoveAdjust(currentOdds, openOdds) {
+  if (!openOdds) return 0;
+  const dec = o => o > 0 ? o/100+1 : 100/Math.abs(o)+1;
+  const movePct = (dec(openOdds) - dec(currentOdds)) / dec(openOdds);
+  // Line moved toward this player (shorter price) = sharp signal
+  if (movePct > 0.05) return +0.02; // sharpened significantly
+  if (movePct < -0.05) return -0.02; // drifted, faded
+  return 0;
+}
+
+function matchProb(p1, p2, surface, openOdds1, openOdds2) {
+  // Start from no-vig market probability
+  const { p1: base1 } = noVigProb(p1.odds, p2.odds);
+  let prob = base1;
+
+  // Apply surface bias for known players
+  const bias1 = SURFACE_BIAS[p1.name]?.[surface] || 0;
+  const bias2 = SURFACE_BIAS[p2.name]?.[surface] || 0;
+  prob = prob + bias1 - bias2;
+
+  // Apply line movement signal
+  const move1 = lineMoveAdjust(p1.odds, openOdds1);
+  const move2 = lineMoveAdjust(p2.odds, openOdds2);
+  prob = prob + move1 - move2;
+
+  return Math.max(0.05, Math.min(0.95, prob));
+}
+
+function calcEdge(trueP, odds) {
+  const imp = impliedProb(odds);
+  return ((trueP - imp) / imp) * 100;
+}
+function calcKelly(trueP, odds) {
+  const b = (odds>0?odds/100+1:100/Math.abs(odds)+1)-1;
+  return Math.max(0,(trueP*b-(1-trueP))/b*0.5);
+}
 function fmt(o) { return o>0?`+${o}`:`${o}`; }
 
 // ── ODDS FETCHER (via /api/odds serverless proxy) ───────────────────────────────
@@ -121,7 +160,11 @@ async function fetchTennis(apiKey) {
         const {b1,b2,o1,o2} = bestOdds(ev.bookmakers, ev.home_team, ev.away_team);
         if (!b1||!b2) continue;
         const p1name = fmtName(ev.home_team), p2name = fmtName(ev.away_team);
-        const trueP1 = matchProb({name:p1name},{name:p2name},surface);
+        const trueP1 = matchProb(
+          {name:p1name, odds:b1},
+          {name:p2name, odds:b2},
+          surface, o1, o2
+        );
         results.push({
           id: ev.id, sport: sport.key, tournament, surface,
           time: new Date(ev.commence_time).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",timeZoneName:"short"}),
