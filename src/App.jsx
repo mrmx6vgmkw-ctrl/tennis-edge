@@ -467,7 +467,7 @@ export default function App() {
   const saveKey=key=>{try{localStorage.setItem("te_key",key)}catch{}setApiKey(key);setMode("live");};
 
   const claude=async(prompt)=>{
-    const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
+    const r=await fetch("/api/ai",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:1000,messages:[{role:"user",content:prompt}]})});
     const d=await r.json();
     return d.content?.map(b=>b.text||"").join("")||"Unavailable.";
   };
