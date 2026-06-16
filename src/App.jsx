@@ -106,8 +106,15 @@ function inferSurf(key) {
   if (key.includes("french_open")||key.includes("monte_carlo")||key.includes("madrid")||
       key.includes("italian")||key.includes("barcelona")||key.includes("hamburg")||
       key.includes("munich")||key.includes("strasbourg")||key.includes("charleston")||
-      key.includes("german")||key.includes("stuttgart")) return "Clay";
+      key.includes("german")||key.includes("stuttgart")||key.includes("roland")) return "Clay";
   return "Hard";
+}
+
+function inferTier(key) {
+  if (key.includes("itf")) return "ITF";
+  if (key.includes("challenger")) return "Challenger";
+  if (key.includes("atp_double")||key.includes("wta_double")) return "Tour";
+  return "Grand Slam / Masters";
 }
 function fmtTournament(key) {
   return key.replace("tennis_atp_","ATP ").replace("tennis_wta_","WTA ")
@@ -190,7 +197,7 @@ async function fetchTennis(apiKey) {
           time: new Date(ev.commence_time).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",timeZoneName:"short"}),
           p1: {name:p1name, seed:null, form:[]},
           p2: {name:p2name, seed:null, form:[]},
-          ml: { p1Odds:b1, p2Odds:b2, trueP1, clv:{p1Open:o1,p2Open:o2}, keyFactor:`${tournament} · ${surface}` },
+          ml: { p1Odds:b1, p2Odds:b2, trueP1, clv:{p1Open:o1,p2Open:o2}, keyFactor:`${tournament} · ${surface} · ${inferTier(sport.key)}` },
           props: [], _live: true,
         });
       }
