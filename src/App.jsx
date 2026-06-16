@@ -89,37 +89,86 @@ async function proxyFetch(url) {
 }
 
 async function fetchTennis(apiKey) {
-  // Step 1: get active sports via our /api/odds serverless proxy
-  const sRes = await proxyFetch(`${BASE}/sports/?apiKey=${apiKey}&all=false`);
-  if (sRes.status === 401) throw new Error("INVALID_KEY");
-  if (!sRes.ok) throw new Error(`Sports list failed: ${sRes.status}`);
-  const allSports = await sRes.json();
-  const remaining = sRes.headers.get("x-requests-remaining");
+  // Route through Claude API using web_search tool to bypass CORS
+  // Claude fetches the Odds API server-side where CORS doesn't apply
+  const prompt = `Fetch this URL and return ONLY the raw JSON response, nothing else, no markdown, no explanation:
+https://api.the-odds-api.com/v4/sports/?apiKey=${apiKey}&all=false`;
 
-  const activeTennis = Array.isArray(allSports)
-    ? allSports.filter(s => s.key?.startsWith("tennis_"))
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4000,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+
+  if (!claudeRes.ok) throw new Error("Claude API error");
+  const claudeData = await claudeRes.json();
+
+  // Extract JSON from Claude's response
+  const textBlock = claudeData.content?.find(b => b.type === "text");
+  if (!textBlock) throw new Error("No response from Claude");
+
+  let sportsJson;
+  try {
+    // Strip any markdown fences
+    const clean = textBlock.text.replace(/```json|```/g, "").trim();
+    sportsJson = JSON.parse(clean);
+  } catch {
+    // Try to extract JSON array from response
+    const match = textBlock.text.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("Could not parse sports list");
+    sportsJson = JSON.parse(match[0]);
+  }
+
+  if (sportsJson.error_code === "invalid-api-key") throw new Error("INVALID_KEY");
+
+  const activeTennis = Array.isArray(sportsJson)
+    ? sportsJson.filter(s => s.key?.startsWith("tennis_"))
     : [];
 
-  if (!activeTennis.length) return { matches: [], quota: { remaining }, activeSports: [] };
+  if (!activeTennis.length) return { matches: [], quota: { remaining: "—" }, activeSports: [] };
 
-  // Step 2: fetch odds for each active tennis sport
+  // Fetch odds for each sport via Claude web_search
   const results = [];
-  let lastRemaining = remaining;
-
-  for (const sport of activeTennis) {
+  for (const sport of activeTennis.slice(0, 5)) { // limit to 5 to save API quota
     try {
-      const res = await proxyFetch(
-        `${BASE}/sports/${sport.key}/odds/?apiKey=${apiKey}&regions=us,uk&markets=h2h&oddsFormat=american`
-      );
-      if (!res.ok) continue;
-      const data = await res.json();
-      lastRemaining = res.headers.get("x-requests-remaining") || lastRemaining;
-      if (!Array.isArray(data)) continue;
+      const oddsPrompt = `Fetch this URL and return ONLY the raw JSON, no explanation, no markdown:
+https://api.the-odds-api.com/v4/sports/${sport.key}/odds/?apiKey=${apiKey}&regions=us,uk&markets=h2h&oddsFormat=american`;
 
+      const oddsRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 8000,
+          tools: [{ type: "web_search_20250305", name: "web_search" }],
+          messages: [{ role: "user", content: oddsPrompt }],
+        }),
+      });
+
+      if (!oddsRes.ok) continue;
+      const oddsData = await oddsRes.json();
+      const oddsText = oddsData.content?.find(b => b.type === "text")?.text || "";
+      const clean = oddsText.replace(/```json|```/g, "").trim();
+
+      let events;
+      try {
+        events = JSON.parse(clean);
+      } catch {
+        const m = clean.match(/\[[\s\S]*\]/);
+        if (!m) continue;
+        events = JSON.parse(m[0]);
+      }
+
+      if (!Array.isArray(events)) continue;
       const surface = inferSurf(sport.key);
       const tournament = fmtTournament(sport.key);
 
-      for (const ev of data) {
+      for (const ev of events) {
         if (!ev.bookmakers?.length) continue;
         const {b1,b2,o1,o2} = bestOdds(ev.bookmakers, ev.home_team, ev.away_team);
         if (!b1||!b2) continue;
@@ -137,8 +186,9 @@ async function fetchTennis(apiKey) {
     } catch { continue; }
   }
 
-  return { matches: results, quota: { remaining: lastRemaining }, activeSports: activeTennis.map(s=>s.title||s.key) };
+  return { matches: results, quota: { remaining: "see the-odds-api.com" }, activeSports: activeTennis.map(s=>s.title||s.key) };
 }
+
 // ── DEMO ──────────────────────────────────────────────────────────────────────
 const DEMO = [
   { id:"d1",tournament:"Wimbledon",surface:"Grass",time:"13:00 BST",_live:false,
